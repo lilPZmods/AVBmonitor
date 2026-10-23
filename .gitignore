@@ -1,0 +1,9 @@
+# build output
+/avbwatch
+/avbprobe
+/build/
+*.app/
+# local
+.DS_Store
+.claude/
+__pycache__/
