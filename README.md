@@ -95,3 +95,7 @@ The log is in `~/Library/Logs/AVBWatch.log`.
 ./install.sh uninstall
 sudo ./setup-recovery.sh remove
 ```
+
+## License
+
+Copyright (c) 2026 Big Dumb Robot. All rights reserved. The source is published for viewing only; no use, copying, modification or distribution is permitted without written permission. See [LICENSE](LICENSE).
