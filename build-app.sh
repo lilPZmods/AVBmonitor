@@ -1,13 +1,15 @@
 #!/bin/zsh
-# Builds "AVB Manager.app" (menu-bar app), installs it in ~/Applications and starts it at login.
+# Builds "AVB Manager.app" (menu-bar app), installs it in /Applications and starts it at login.
 set -e
 cd "$(dirname "$0")"
-APP="$HOME/Applications/AVB Manager.app"
+APP="/Applications/AVB Manager.app"
+OLD="$HOME/Applications/AVB Manager.app"   # earlier versions installed here
 LABEL=ca.arraymusic.avbmanager-app
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 pkill -x "AVB Manager" 2>/dev/null || true
+rm -rf "$OLD"
 if [[ "$1" == "uninstall" ]]; then rm -rf "$APP" "$PLIST"; echo "AVB Manager app removed"; exit 0; fi
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -42,4 +44,4 @@ cat > "$PLIST" <<EOF
 </dict></plist>
 EOF
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "AVB Manager installed in ~/Applications and running (look for the icon in the menu bar)."
+echo "AVB Manager installed in /Applications and running (look for the icon in the menu bar)."

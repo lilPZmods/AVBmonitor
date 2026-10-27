@@ -47,7 +47,7 @@ macOS's built-in AVB support often loses two-way audio and doesn't recover. Thre
 
 ```sh
 ./install.sh                 # build + start the background manager (LaunchAgent)
-./build-app.sh               # build + install the menu-bar app in ~/Applications
+./build-app.sh               # build + install the menu-bar app in /Applications
 sudo ./setup-recovery.sh     # optional: let approved recoveries restart the audio engine
 ```
 
