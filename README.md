@@ -22,6 +22,7 @@ macOS's built-in AVB support often loses two-way audio and doesn't recover. Thre
   2. You approve, and the manager restarts the audio engine.
   3. It reconnects and verifies every route, then runs an optional loop test (a tone out on one channel, checked on the return).
   4. It reopens your session.
+- **Alerts** come from the menu-bar app, so they only appear while it's running. Quit it and the background manager keeps protecting routes silently. Clicking an alert opens the app's panel.
 - **DAW engine check.** It warns if Pro Tools isn't using the expected audio device, for example when it has fallen back from your aggregate device to the bare AVB device.
 
 ## Pieces

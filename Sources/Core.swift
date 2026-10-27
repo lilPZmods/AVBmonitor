@@ -37,12 +37,24 @@ func log(_ s: String) {
     }
 }
 
+/// An alert for the menu-bar app to show. The manager only queues it; the app posts it as a macOS
+/// notification, so alerts appear only while the app is running and clicking one opens the app.
+struct Notice: Codable { var id: Int64; var title: String; var message: String }
+
+private let noticeLock = NSLock()
+private var notices: [Notice] = []
+
 func notify(_ title: String, _ msg: String) {
-    let clean = msg.replacingOccurrences(of: "\"", with: "'")
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    p.arguments = ["-e", "display notification \"\(clean)\" with title \"\(title)\" sound name \"Basso\""]
-    try? p.run()
+    noticeLock.lock(); defer { noticeLock.unlock() }
+    // ids are millisecond timestamps, so they keep increasing across manager restarts
+    let id = max(Int64(Date().timeIntervalSince1970 * 1000), (notices.last?.id ?? 0) + 1)
+    notices.append(Notice(id: id, title: title, message: msg))
+    if notices.count > 20 { notices.removeFirst(notices.count - 20) }
+}
+
+func recentNotices() -> [Notice] {
+    noticeLock.lock(); defer { noticeLock.unlock() }
+    return notices
 }
 
 func hex(_ v: UInt64) -> String { String(format: "%016llx", v) }

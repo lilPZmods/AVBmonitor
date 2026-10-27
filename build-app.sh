@@ -12,6 +12,7 @@ if [[ "$1" == "uninstall" ]]; then rm -rf "$APP" "$PLIST"; echo "AVB Manager app
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -parse-as-library App/*.swift -o "$APP/Contents/MacOS/AVB Manager"
+cp /System/Library/Sounds/Basso.aiff "$APP/Contents/Resources/" 2>/dev/null || true   # alert sound
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

@@ -130,6 +130,10 @@ final class WebServer {
                 guard admin else { return json(401, ["error": "Admin password required"]) }
                 manager.queue.sync { manager.dismissRecovery() }
                 return json(200, ["ok": true])
+            case "/api/recovery/clear":
+                guard admin else { return json(401, ["error": "Admin password required"]) }
+                try manager.queue.sync { try manager.clearRecovery() }
+                return json(200, ["ok": true, "message": "Recovery results cleared"])
             case "/api/recovery/propose":
                 guard admin else { return json(401, ["error": "Admin password required"]) }
                 manager.queue.sync { if !manager.recoveryState.pending && !manager.recoveryState.running { manager.propose(reason: "Recovery requested manually by the admin.") } }

@@ -4,6 +4,7 @@
 
 import AppKit
 import SwiftUI
+import UserNotifications
 
 // MARK: - Models (mirror the manager's /api/state JSON)
 
@@ -22,9 +23,11 @@ struct RecoveryInfo: Codable, Hashable {
     var finishedAt: String; var ok: Bool?; var dawName: String; var dawRunning: Bool; var sessionName: String; var sessionPath: String
     var loopChannel: Int; var helperInstalled: Bool
 }
+struct Notice: Codable, Hashable { var id: Int64; var title: String; var message: String }
 struct StateInfo: Codable {
     var time: String; var link: Bool; var healthy: Bool; var adminConfigured: Bool; var sniffing: Bool
     var engineWarning: String?; var recovery: RecoveryInfo; var devices: [DeviceInfo]; var events: [EventInfo]
+    var notices: [Notice]?
 }
 
 // MARK: - Client
@@ -53,9 +56,25 @@ final class Store: ObservableObject {
             guard (r as? HTTPURLResponse)?.statusCode == 200 else { return }
             state = try JSONDecoder().decode(StateInfo.self, from: d)
             reachable = true
+            deliver(state?.notices ?? [])
         } catch {
             reachable = false
         }
+    }
+
+    /// Post the manager's new alerts as macOS notifications. Alerts only show while this app runs.
+    private var lastNotice: Int64?
+    private func deliver(_ notices: [Notice]) {
+        let newest = notices.map(\.id).max() ?? 0
+        guard let last = lastNotice else { lastNotice = newest; return }   // don't replay old alerts at launch
+        for n in notices where n.id > last {
+            let c = UNMutableNotificationContent()
+            c.title = n.title
+            c.body = n.message
+            c.sound = UNNotificationSound(named: UNNotificationSoundName("Basso.aiff"))
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "avb-\(n.id)", content: c, trigger: nil))
+        }
+        lastNotice = max(last, newest)
     }
 
     @discardableResult
@@ -110,15 +129,57 @@ final class Store: ObservableObject {
 
 // MARK: - App
 
+extension Notification.Name { static let openRouting = Notification.Name("AVBOpenRouting") }
+
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    func applicationDidFinishLaunching(_ n: Notification) {
+        let c = UNUserNotificationCenter.current()
+        c.delegate = self
+        c.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    // show alerts even when the app is frontmost
+    func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification,
+                                withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
+        done([.banner, .sound])
+    }
+
+    // clicking an alert opens the menu-bar panel (or the routing window if the panel can't be found)
+    func userNotificationCenter(_ c: UNUserNotificationCenter, didReceive r: UNNotificationResponse,
+                                withCompletionHandler done: @escaping () -> Void) {
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            if !Self.openMenuPanel() { NotificationCenter.default.post(name: .openRouting, object: nil) }
+            done()
+        }
+    }
+
+    static func openMenuPanel() -> Bool {
+        // already open: leave it (clicking the icon again would close it)
+        if NSApp.windows.contains(where: { $0.isVisible && $0.className.contains("MenuBarExtra") }) { return true }
+        func button(in v: NSView?) -> NSStatusBarButton? {
+            guard let v = v else { return nil }
+            if let b = v as? NSStatusBarButton { return b }
+            for s in v.subviews { if let b = button(in: s) { return b } }
+            return nil
+        }
+        for w in NSApp.windows where w.className.contains("StatusBar") {
+            if let b = button(in: w.contentView) { b.performClick(nil); return true }
+        }
+        return false
+    }
+}
+
 @main
 struct AVBManagerApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var store = Store()
 
     var body: some Scene {
         MenuBarExtra {
             MenuView().environmentObject(store)
         } label: {
-            Image(systemName: icon)
+            MenuIcon(name: icon)
         }
         .menuBarExtraStyle(.window)
 
@@ -135,6 +196,46 @@ struct AVBManagerApp: App {
         case .offline: return "antenna.radiowaves.left.and.right.slash"
         }
     }
+}
+
+/// The menu-bar icon. It's always on screen, so it also opens the routing window when asked.
+struct MenuIcon: View {
+    let name: String
+    @Environment(\.openWindow) private var openWindow
+    var body: some View {
+        Image(systemName: name)
+            .onReceive(NotificationCenter.default.publisher(for: .openRouting)) { _ in openWindow(id: "routing") }
+    }
+}
+
+/// Buttons in the menu-bar panel. The standard style draws them grey (as if disabled) because the
+/// panel is never the key window, so these use their own fixed colours.
+struct PanelButtonStyle: ButtonStyle {
+    var tint: Color = .accentColor
+    var prominent = false
+    func makeBody(configuration: Configuration) -> some View { Face(configuration: configuration, tint: tint, prominent: prominent) }
+
+    struct Face: View {
+        let configuration: Configuration
+        let tint: Color
+        let prominent: Bool
+        @Environment(\.isEnabled) private var enabled
+        var body: some View {
+            configuration.label
+                .font(.callout.weight(.medium))
+                .foregroundColor(prominent ? .white : tint)
+                .padding(.horizontal, 10).padding(.vertical, 4)
+                .background(RoundedRectangle(cornerRadius: 6).fill(prominent ? tint : tint.opacity(0.15)))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(tint.opacity(prominent ? 0 : 0.35), lineWidth: 1))
+                .opacity(!enabled ? 0.4 : configuration.isPressed ? 0.7 : 1)
+                .contentShape(Rectangle())
+        }
+    }
+}
+
+extension ButtonStyle where Self == PanelButtonStyle {
+    static var panel: PanelButtonStyle { PanelButtonStyle() }
+    static func panel(_ tint: Color, prominent: Bool = false) -> PanelButtonStyle { PanelButtonStyle(tint: tint, prominent: prominent) }
 }
 
 extension Store.Level {
@@ -169,21 +270,28 @@ struct MenuView: View {
             }
             if let m = store.message { Text(m).font(.caption).foregroundColor(.secondary) }
             Divider()
-            HStack {
+            HStack(spacing: 8) {
                 Button("Routing…") { openWindow(id: "routing"); NSApp.activate(ignoringOtherApps: true) }
+                    .buttonStyle(.panel)
                 Button("Web Page") { NSWorkspace.shared.open(URL(string: "http://localhost:8077/")!) }
+                    .buttonStyle(.panel)
                 Spacer()
                 if let r = store.state?.recovery, !r.pending, !r.running {
                     Button("Recovery…") { Task { await store.post("api/recovery/propose") } }
+                        .buttonStyle(.panel(.orange))
                         .help("Prepare an audio engine restart and approve it here")
                 }
                 Button("Quit") { NSApp.terminate(nil) }
+                    .buttonStyle(.panel(.primary))
+                    .help("Quit the app. Routes stay protected in the background, but no alerts are shown until you open it again.")
             }
         }
         .padding(14)
         .frame(width: 400)
     }
 }
+
+let tsFormatApp: DateFormatter = { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"; return f }()
 
 struct RecoveryPanel: View {
     @EnvironmentObject var store: Store
@@ -193,6 +301,14 @@ struct RecoveryPanel: View {
     @State private var channel = 30
 
     var daw: String { r.dawName.isEmpty ? "Pro Tools" : r.dawName }
+    /// "14:02:10" today, "Oct 24 14:02" on an earlier day
+    var finished: String {
+        let today = String(tsFormatApp.string(from: Date()).prefix(10))
+        if r.finishedAt.hasPrefix(today) { return String(r.finishedAt.suffix(8)) }
+        guard let d = tsFormatApp.date(from: r.finishedAt) else { return r.finishedAt }
+        let f = DateFormatter(); f.dateFormat = "MMM d HH:mm"
+        return f.string(from: d)
+    }
 
     var body: some View {
         if r.pending {
@@ -223,17 +339,27 @@ struct RecoveryPanel: View {
                         Task { await store.post("api/recovery/approve", ["reopenDAW": reopen, "loopChannel": loopTest ? channel : 0]) }
                     }
                     .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.panel(.accentColor, prominent: true))
                     .disabled(r.dawRunning)
                     .help(r.dawRunning ? "Quit \(daw) first" : "Restart the audio engine and reconnect")
                     Button("Dismiss") { Task { await store.post("api/recovery/dismiss") } }
+                        .buttonStyle(.panel(.primary))
                 }
             }
             .padding(10).background(Color.red.opacity(0.08)).cornerRadius(8)
             .onAppear { if r.loopChannel > 0 { channel = r.loopChannel } }
         } else if r.running || !r.finishedAt.isEmpty && r.ok != nil && !r.steps.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
-                Text(r.running ? "Recovery running…" : (r.ok == true ? "Recovery finished \(String(r.finishedAt.suffix(8)))" : "Recovery failed \(String(r.finishedAt.suffix(8)))"))
-                    .font(.headline).foregroundColor(r.running ? .orange : (r.ok == true ? .green : .red))
+                HStack {
+                    Text(r.running ? "Recovery running…" : (r.ok == true ? "Recovery finished \(finished)" : "Recovery failed \(finished)"))
+                        .font(.headline).foregroundColor(r.running ? .orange : (r.ok == true ? .green : .red))
+                    Spacer()
+                    if !r.running {
+                        Button("Clear") { Task { await store.post("api/recovery/clear") } }
+                            .buttonStyle(.panel(.primary))
+                            .help("Remove these recovery results")
+                    }
+                }
                 ForEach(r.steps, id: \.self) { s in
                     HStack(alignment: .top, spacing: 6) {
                         Image(systemName: icon(s.status)).foregroundColor(color(s.status)).frame(width: 14)

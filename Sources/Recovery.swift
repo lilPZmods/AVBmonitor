@@ -145,6 +145,15 @@ extension Manager {
         event("info", "Recovery request dismissed by admin")
     }
 
+    /// Clear a finished recovery's results from the app and web page.
+    func clearRecovery() throws {
+        guard !recoveryState.running else { throw APIError(status: 409, message: "Recovery is still running.") }
+        guard !recoveryState.pending else { throw APIError(status: 409, message: "A recovery is waiting for approval. Approve or dismiss it instead.") }
+        recoveryState = RecoveryInfo()
+        publishRecovery()
+        event("info", "Recovery results cleared by admin")
+    }
+
     func approveRecovery(_ o: RecoveryOptions) throws {
         guard !recoveryState.running else { throw APIError(status: 409, message: "Recovery is already running.") }
         if !recoveryState.pending { propose(reason: "Recovery started manually by the admin.") }

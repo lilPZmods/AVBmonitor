@@ -38,6 +38,7 @@ struct StateInfo: Codable {
     var recovery: RecoveryInfo
     var devices: [DeviceInfo]
     var events: [EventInfo]
+    var notices: [Notice] = []
 }
 
 struct APIError: Error { var status: Int; var message: String }
@@ -164,6 +165,7 @@ final class Manager {
         stateLock.lock(); defer { stateLock.unlock() }
         guard var s = snapshot else { return nil }
         s.events = events
+        s.notices = recentNotices()
         return s
     }
 
