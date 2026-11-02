@@ -2,6 +2,7 @@
 /avbwatch
 /avbprobe
 /build/
+/dist/
 *.app/
 # local
 .DS_Store

@@ -39,6 +39,9 @@ struct StateInfo: Codable {
     var devices: [DeviceInfo]
     var events: [EventInfo]
     var notices: [Notice] = []
+    var released = false       // admin has released the network: locks are saved but not enforced
+    var savedLocks = 0         // routes that will be enforced again when the admin locks up
+    var offline: [String] = [] // devices in locked routes that are switched off / off the network (routes paused)
 }
 
 struct APIError: Error { var status: Int; var message: String }
@@ -60,9 +63,20 @@ final class Manager {
     var cfg: Config { watcher.cfg }
     var ctl: AVBControl { watcher.ctl }
 
+    func setAdminPassword(_ password: String) throws {
+        guard cfg.adminHash.isEmpty else { throw APIError(status: 409, message: "The admin password is already set.") }
+        var updated = cfg
+        updated.adminSalt = UUID().uuidString
+        updated.adminHash = Config.hash(password, salt: updated.adminSalt)
+        watcher.cfg = updated
+        saveConfig(updated)
+    }
+
     init(_ cfg: Config) {
         watcher = Watcher(cfg)
         watcher.describe = { [unowned self] in self.describe($0) }
+        watcher.deviceName = { [unowned self] in self.deviceName($0) }
+        watcher.note = { [unowned self] in self.event("info", $0) }
     }
 
     // MARK: events
@@ -80,6 +94,13 @@ final class Manager {
     func deviceName(_ id: UInt64) -> String {
         if let n = cfg.deviceNames[hex(id)], !n.isEmpty { return n }
         if let n = names[id]?.name { return n }
+        // not seen since the manager started (e.g. switched off): use the name saved in a locked route's label
+        for c in cfg.connections {
+            let parts = c.label.components(separatedBy: " -> ")
+            guard parts.count == 2 else { continue }
+            let side = c.talkerID == id ? parts[0] : c.listenerID == id ? parts[1] : nil
+            if let n = side?.components(separatedBy: " / ").first, !n.isEmpty { return n }
+        }
         return "device \(hex(id).suffix(6))"
     }
 
@@ -104,7 +125,8 @@ final class Manager {
         for e in entities() where e.mac.count == 6 {
             let m = e.mac.reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
             let eui = (m >> 24) << 40 | 0xFFFE << 24 | (m & 0xFFFFFF)
-            if controller == e.id || controller >> 16 == m || controller == eui { return "\(deviceName(e.id)) (\(e.macString))" }
+            // Macs use their entity ID with the last 2 bytes cleared as their controller ID
+            if controller == e.id || controller >> 16 == m || controller == eui || controller >> 16 == e.id >> 16 { return "\(deviceName(e.id)) (\(e.macString))" }
         }
         let m = controller >> 16
         let mac = (0..<6).map { String(format: "%02x", (m >> (8 * (5 - $0))) & 0xff) }.joined(separator: ":")
@@ -127,7 +149,7 @@ final class Manager {
     private func refresh(link: Bool) {
         let ents = entities().sorted { ($0.local ? 0 : 1, $0.id) < ($1.local ? 0 : 1, $1.id) }
         var devices: [DeviceInfo] = []
-        let locks = Dictionary(cfg.connections.map { ($0.sinkKey, $0) }, uniquingKeysWith: { a, _ in a })
+        let locks = Dictionary(cfg.enforced.map { ($0.sinkKey, $0) }, uniquingKeysWith: { a, _ in a })
         for e in ents {
             loadNames(e)
             var sinks: [SinkInfo] = []
@@ -150,9 +172,11 @@ final class Manager {
         }
         stateLock.lock()
         snapshot = StateInfo(time: tsFormat.string(from: Date()), link: link,
-                             healthy: link && cfg.connections.allSatisfy { watcher.lastResult[$0.sinkKey] == .ok },
+                             healthy: link && cfg.enforced.allSatisfy { watcher.lastResult[$0.sinkKey] == .ok },
                              adminConfigured: !cfg.adminHash.isEmpty, sniffing: sniffing,
-                             engineWarning: engineWarning(), recovery: recoveryState, devices: devices, events: events)
+                             engineWarning: engineWarning(), recovery: recoveryState, devices: devices, events: events,
+                             released: cfg.released, savedLocks: cfg.connections.count,
+                             offline: watcher.offlineDevices.sorted().map { deviceName($0) })
         stateLock.unlock()
     }
 
@@ -192,6 +216,12 @@ final class Manager {
         else { msg = "\(cfg.daw) is set to \(cfg.expectedAudioDevice) but its devices are not running. Restart \(cfg.daw)." }
         if engineBadSince == nil { engineBadSince = Date() }
         engineMessage = msg
+        if let off = watcher.offlineDevices.first {
+            // e.g. the console (clock master) is switched off: the Mac's AVB device goes away with it
+            engineMessage = msg + " (\(deviceName(off)) is off or not on the network.)"
+            engineBadSince = nil
+            return
+        }
         // allow 20 s for the DAW to start its engine before alerting
         if !engineAlerted, Date().timeIntervalSince(engineBadSince!) > 20 {
             engineAlerted = true
@@ -206,7 +236,7 @@ final class Manager {
         queue.sync {
             autoreleasepool {
                 let link = linkUp(cfg.interface)
-                if !cfg.connections.isEmpty || !link { watcher.cycle(fix: true) }
+                if !cfg.enforced.isEmpty || !link { watcher.cycle(fix: true) }
                 checkEngine()
                 if link { checkEngineDead() }
                 refresh(link: link)
@@ -218,7 +248,7 @@ final class Manager {
         let sniffer = Sniffer(cfg.interface)
         sniffer.onEvent = { [weak self] e in self?.queue.async { self?.handle(e) } }
         sniffing = sniffer.start()
-        event("info", "manager started - \(cfg.connections.count) locked routes, web page on port \(cfg.webPort)")
+        event("info", "manager started - \(cfg.connections.count) locked routes\(cfg.released ? " (network released, not enforced)" : ""), web page on port \(cfg.webPort)")
         while true {
             tick()
             _ = wake.wait(timeout: .now() + cfg.pollSeconds)
@@ -227,13 +257,13 @@ final class Manager {
 
     /// A connect/disconnect happened somewhere on the network.
     private func handle(_ e: ACMPEvent) {
-        let ours = e.controller == ctl.controller && watcher.isSelfAction(e.sinkKey)
+        let ours = e.controller == ctl.controller && watcher.isSelfAction(e.sinkKey, at: e.time)
         if ours { return }
         let who = whoName(e.controller)
         let what = e.connect
             ? "connected \(deviceName(e.talker)) / \(sourceName(e.talker, e.talkerUID)) -> \(deviceName(e.listener)) / \(sinkName(e.listener, e.listenerUID))"
             : "disconnected \(deviceName(e.listener)) / \(sinkName(e.listener, e.listenerUID))"
-        if let lock = cfg.connections.first(where: { $0.sinkKey == e.sinkKey }) {
+        if let lock = cfg.enforced.first(where: { $0.sinkKey == e.sinkKey }) {
             let sameAsLock = e.connect && e.talker == lock.talkerID && e.talkerUID == lock.talkerUID
             if sameAsLock { event("info", "\(who) \(what) (matches lock)"); return }
             event("revert", "LOCKED ROUTE CHANGED by \(who): \(what) - restoring \(describe(lock))")
@@ -262,7 +292,7 @@ final class Manager {
         watcher.cfg.connections.append(labeled)
         persist()
         watcher.forceNow.insert(c.sinkKey)   // connect it now if it isn't already
-        event("lock", "LOCKED by admin: \(describe(c))")
+        event("lock", cfg.released ? "SAVED for next lock-up by admin: \(describe(c))" : "LOCKED by admin: \(describe(c))")
         wake.signal()
         return describe(c)
     }
@@ -274,6 +304,36 @@ final class Manager {
         watcher.lastResult[key] = nil
         persist()
         event("lock", "UNLOCKED by admin: \(describe(c))")
+    }
+
+    /// Hand the network back to everyone: stop enforcing locks but keep them saved. Nothing is disconnected.
+    func release() -> String {
+        guard !cfg.released else { return "The network is already released" }
+        watcher.cfg.released = true
+        persist()
+        for c in cfg.connections { watcher.lastResult[c.sinkKey] = nil }
+        watcher.forceNow.removeAll()
+        watcher.suppressRepairForTalker = nil
+        watcher.offlineDevices = []
+        deadCycles = 0
+        if recoveryState.pending { recoveryState.pending = false; publishRecovery() }
+        event("lock", "NETWORK RELEASED by admin - \(cfg.connections.count) locked routes saved, anyone can patch now")
+        return "Network released. Your \(cfg.connections.count) routes are saved for next time."
+    }
+
+    /// Take the network back: enforce the saved locks again and reconnect them right away.
+    func engage() -> String {
+        guard cfg.released else { return "Your routes are already locked" }
+        watcher.cfg.released = false
+        persist()
+        for c in cfg.connections {
+            watcher.badStreak[c.key] = 0; watcher.failedFixes[c.key] = 0
+            watcher.nextAttempt[c.key] = nil; watcher.alerted.remove(c.key)
+            watcher.forceNow.insert(c.sinkKey)
+        }
+        event("lock", "NETWORK LOCKED by admin - restoring \(cfg.connections.count) saved routes")
+        wake.signal()
+        return "Locked. Restoring your \(cfg.connections.count) routes."
     }
 
     func rename(id: UInt64, name: String) {
@@ -305,7 +365,7 @@ final class Manager {
     /// Patch (or clear, when talker is nil) one listener input. Locked inputs need the admin password.
     func patch(listener: UInt64, luid: UInt16, talker: UInt64?, tuid: UInt16?, admin: Bool) throws -> String {
         let key = "\(hex(listener))[\(luid)]"
-        let locked = cfg.connections.contains { $0.sinkKey == key }
+        let locked = cfg.enforced.contains { $0.sinkKey == key }
         if locked && !admin { throw APIError(status: 403, message: "This input is locked by the admin.") }
         if !admin, let me = entities().first(where: { $0.local }), listener == me.id || talker == me.id {
             throw APIError(status: 403, message: "Only the admin can patch this Mac's own AVB streams (changing them can stop its audio engine).")

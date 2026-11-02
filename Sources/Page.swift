@@ -10,13 +10,13 @@ let pageHTML = #"""
 <style>
   :root {
     --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e3e3de;
-    --ok: #1f8a4c; --ok-bg: #e6f4ec; --bad: #c0362c; --bad-bg: #fbe9e7; --warn: #9a6400; --warn-bg: #fdf3dc;
+    --ok: #1f8a4c; --ok-bg: #e6f4ec; --bad: #c0362c; --bad-bg: #fbe9e7; --warn: #9a6400; --warn-bg: #fdf3dc; --bypass-bg: #ececea;
     --accent: #2f5bd3; --lock: #7a4fd1; --lock-bg: #f0eafb;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
       --bg: #151514; --panel: #1f1f1d; --text: #ecece8; --muted: #9b9b94; --line: #33332f;
-      --ok: #4cc382; --ok-bg: #173324; --bad: #ff7a6e; --bad-bg: #3a1c19; --warn: #f0b84a; --warn-bg: #352a12;
+      --ok: #4cc382; --ok-bg: #173324; --bad: #ff7a6e; --bad-bg: #3a1c19; --warn: #f0b84a; --warn-bg: #352a12; --bypass-bg: #2a2a27;
       --accent: #7c9cff; --lock: #b394ff; --lock-bg: #2a2140;
     }
   }
@@ -32,6 +32,8 @@ let pageHTML = #"""
   .banner { padding: 12px 14px; border-radius: 8px; margin-bottom: 14px; font-weight: 500; }
   .banner.warn { background: var(--warn-bg); color: var(--warn); }
   .banner.bad { background: var(--bad-bg); color: var(--bad); }
+  .pill.bypass { color: var(--muted); background: var(--bypass-bg); }
+  .banner.bypass { background: var(--bypass-bg); color: var(--muted); }
   .admin { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   input[type=password] { padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); width: 170px; }
   button { padding: 7px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; font: inherit; font-size: 14px; }
@@ -102,6 +104,19 @@ async function login() {
   catch (e) { isAdmin = false; toast(e.message); }
   render();
 }
+async function setupPassword() {
+  const first = $("#new-pw").value, second = $("#confirm-pw").value;
+  if (first !== second) { toast("Passwords don't match"); return; }
+  pw = first;
+  try {
+    await api("/api/setup-password", { password: pw });
+    await api("/api/login", { _login: true });
+    isAdmin = true;
+    try { sessionStorage.setItem("avbpw", pw); } catch (e) {}
+    toast("Admin password set");
+  } catch (e) { isAdmin = false; toast(e.message); }
+  render();
+}
 function logout() { isAdmin = false; pw = ""; try { sessionStorage.removeItem("avbpw"); } catch (e) {} render(); }
 
 async function act(fn, ...args) {
@@ -117,6 +132,8 @@ const patch = (listener, luid, value) => {
 const lock = (listener, luid) => api("/api/lock", { listener, luid });
 const unlock = (listener, luid) => api("/api/unlock", { listener, luid });
 const rename = (id, cur) => { const n = prompt("Name for this device (leave empty to reset):", cur); return n === null ? null : api("/api/rename", { id, name: n }); };
+const releaseNet = () => confirm("Release the network? Your locked routes are saved but no longer enforced, so anyone can repatch anything. Nothing is disconnected.") ? api("/api/release") : null;
+const engageNet = () => confirm(`Lock up? Your ${state.savedLocks} saved routes are restored right away, replacing whatever other people have patched there.`) ? api("/api/engage") : null;
 const lockAll = () => confirm("Lock every route that is connected right now?") ? api("/api/lockall") : null;
 
 function srcLabel(id, uid) {
@@ -130,21 +147,31 @@ function render() {
   if (!state) return;
   // header
   const lockedSinks = state.devices.flatMap(d => d.sinks.filter(s => s.locked));
-  const bad = lockedSinks.filter(s => !s.ok).length;
+  const isPaused = s => !s.ok && s.state.startsWith("paused");
+  const bad = lockedSinks.filter(s => !s.ok && !isPaused(s)).length;
+  const offline = state.offline || [];
   const h = $("#health");
   if (!state.link) { h.className = "pill bad"; h.textContent = "No AVB link"; }
   else if (bad) { h.className = "pill bad"; h.textContent = `${bad} locked route${bad > 1 ? "s" : ""} failing`; }
+  else if (state.released) { h.className = "pill bypass"; h.textContent = `☁ Bypassed · network released, ${state.savedLocks} routes saved`; }
+  else if (offline.length) { h.className = "pill bypass"; h.textContent = `☁ Bypassed · ${offline.join(", ")} is off`; }
   else { h.className = "pill ok"; h.textContent = lockedSinks.length ? `All ${lockedSinks.length} locked routes OK` : "Connected"; }
 
   $("#admin").innerHTML = isAdmin
-    ? `<span class="lk">Admin</span><button class="lock" onclick="act(lockAll)">Lock all current routes</button><button onclick="logout()">Sign out</button>`
+    ? `<span class="lk">Admin</span>`
+      + (state.released
+          ? `<button class="primary" onclick="act(engageNet)">Lock my routes</button>`
+          : `<button onclick="act(releaseNet)">Release network</button>`)
+      + `<button class="lock" onclick="act(lockAll)">${state.released ? "Save" : "Lock"} all current routes</button><button onclick="logout()">Sign out</button>`
     : state.adminConfigured
       ? `<input type="password" id="pw" placeholder="Admin password" onkeydown="if(event.key==='Enter')login()"><button class="primary" onclick="login()">Sign in</button>`
-      : `<span class="muted">No admin password set. On the iMac run <code>avbwatch passwd</code></span>`;
+      : `<input type="password" id="new-pw" placeholder="New admin password"><input type="password" id="confirm-pw" placeholder="Confirm password" onkeydown="if(event.key==='Enter')setupPassword()"><button class="primary" onclick="setupPassword()">Set password</button><span class="muted">Initial setup is available on this Mac only.</span>`;
 
   let banners = "";
   if (!state.link) banners += `<div class="banner bad">The AVB Ethernet link on the manager iMac is down. Check the cable and the MOTU switch.</div>`;
-  if (state.engineWarning) banners += `<div class="banner warn">${esc(state.engineWarning)}</div>`;
+  if (state.released) banners += `<div class="banner bypass">The network is released: anyone can patch any input. ${state.savedLocks} locked routes are saved and come back when the admin locks up.</div>`;
+  if (offline.length && !state.released) banners += `<div class="banner bypass">${esc(offline.join(", "))} is off or not on the network. Its locked routes are paused and reconnect automatically when it is back.</div>`;
+  if (state.engineWarning) banners += `<div class="banner ${offline.length || state.released ? "bypass" : "warn"}">${esc(state.engineWarning)}</div>`;
   if (!state.sniffing) banners += `<div class="banner warn">Change tracking is off (no packet access), so the activity list can't show who changed a route. Locks are still enforced.</div>`;
   $("#banners").innerHTML = banners;
 
@@ -163,7 +190,7 @@ function render() {
       );
       if (cur && !talkers.some(t => t.id === s.talker)) opts.push(`<option value="${cur}" selected>${esc(srcLabel(s.talker, s.talkerUID))}</option>`);
       const status = s.locked
-        ? `<span class="st ${s.ok ? "ok" : "bad"}">${s.ok ? "Locked · OK" : esc(s.state)}</span>`
+        ? `<span class="st ${s.ok ? "ok" : isPaused(s) ? "muted" : "bad"}">${s.ok ? "Locked · OK" : esc(s.state)}</span>`
         : `<span class="st muted">${s.talker ? "connected" : "—"}</span>`;
       const lockCell = s.locked
         ? (isAdmin ? `<button class="lock" onclick="act(unlock,'${d.id}',${s.uid})">Unlock</button>` : `<span class="lk">🔒 Locked</span>`)

@@ -38,35 +38,16 @@ macOS's built-in AVB support often loses two-way audio and doesn't recover. Thre
 
 ## Requirements
 
-- macOS 13 or later, with AVB enabled for the Ethernet port in Audio MIDI Setup (Network Device Browser)
-- Xcode Command Line Tools (`xcode-select --install`) to build
-- Python 3, for the Pro Tools helper
+- macOS 13 or later on Apple silicon, with AVB enabled for the Ethernet port in Audio MIDI Setup (Network Device Browser)
 - Read access to `/dev/bpf*` (the `access_bpf` group, set up by Wireshark's ChmodBPF or similar). It's only used to see *who* changed a route. Everything else works without it.
 
 ## Install
 
-```sh
-./install.sh                 # build + start the background manager (LaunchAgent)
-./build-app.sh               # build + install the menu-bar app in /Applications
-sudo ./setup-recovery.sh     # optional: let approved recoveries restart the audio engine
-```
+Download `AVBManager-macos-arm64.pkg` from the latest GitHub release, then open it and follow the installer. Because this package is unsigned, macOS may block the first open; Control-click the package, choose **Open**, and confirm. The package includes the compiled menu-bar app, background manager, AVB probe, and Pro Tools helper; no Xcode, Python, or terminal commands are needed. The installer asks for your macOS administrator password to install the app, start its login services, and enable the recovery action that can restart only `coreaudiod` after an admin approves recovery.
 
-Then lock your working routes: open the menu-bar app, go to **Routing…**, and click **Lock all current routes** while audio works in both directions. To set the web page's admin password:
+Open `http://localhost:8077/` on the AVB Manager Mac to set the initial admin password. Then lock your working routes: open the menu-bar app, go to **Routing…**, and click **Lock all current routes** while audio works in both directions.
 
-```sh
-~/Library/Application\ Support/AVBWatch/avbwatch passwd
-```
-
-## Command line
-
-```
-avbwatch status        check every locked route once
-avbwatch fix           check once and repair anything broken
-avbwatch learn         lock this Mac's current connections
-avbwatch locks         list locked routes
-avbwatch counters      stream IDs and packet counters per route
-avbwatch passwd        set the web admin password
-```
+When a production is done, click **Release network** in the menu-bar app (or on the web page as admin). Your locked routes stay saved but are no longer enforced, so anyone can patch anything, and nothing is disconnected. Click **Lock my routes** to take the network back: the saved routes are restored right away. Patching this Mac's own AVB streams still needs the admin, even when released.
 
 ## Configuration
 
@@ -91,11 +72,7 @@ The log is in `~/Library/Logs/AVBWatch.log`.
 
 ## Uninstall
 
-```sh
-./build-app.sh uninstall
-./install.sh uninstall
-sudo ./setup-recovery.sh remove
-```
+Remove **AVB Manager.app** from Applications and delete `~/Library/Application Support/AVBWatch` and `~/Library/LaunchAgents/ca.arraymusic.avbwatch*.plist`. To remove the optional recovery permission, an administrator can delete `/etc/sudoers.d/avbwatch`.
 
 ## License
 

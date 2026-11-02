@@ -1,0 +1,56 @@
+#!/bin/zsh
+set -euo pipefail
+
+TARGET="${3:-/}"
+CONSOLE_USER="$(/usr/bin/stat -f '%Su' /dev/console)"
+[[ "$CONSOLE_USER" != "root" && "$CONSOLE_USER" != "loginwindow" ]] || {
+  print -u2 "Log in to the Mac before installing AVB Manager."
+  exit 1
+}
+USER_ID="$(/usr/bin/id -u "$CONSOLE_USER")"
+USER_HOME="$(/usr/bin/dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory | /usr/bin/sed 's/^[^:]*: //')"
+SUPPORT="$USER_HOME/Library/Application Support/AVBWatch"
+BIN="$SUPPORT/bin"
+AGENTS="$USER_HOME/Library/LaunchAgents"
+
+/bin/mkdir -p "$BIN" "$AGENTS" "$USER_HOME/Library/Logs"
+/bin/cp "$TARGET/Library/Application Support/AVBWatch/bin/avbwatch" "$BIN/"
+/bin/cp "$TARGET/Library/Application Support/AVBWatch/bin/avbprobe" "$BIN/"
+/bin/cp "$TARGET/Library/Application Support/AVBWatch/bin/pthelper" "$BIN/"
+/bin/chmod 755 "$BIN/avbwatch" "$BIN/avbprobe" "$BIN/pthelper"
+/usr/sbin/chown -R "$CONSOLE_USER" "$SUPPORT"
+
+cat > "$AGENTS/ca.arraymusic.avbwatch.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>ca.arraymusic.avbwatch</string>
+  <key>ProgramArguments</key><array><string>$BIN/avbwatch</string><string>run</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>$USER_HOME/Library/Logs/AVBWatch.err.log</string>
+</dict></plist>
+EOF
+cat > "$AGENTS/ca.arraymusic.avbmanager-app.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>ca.arraymusic.avbmanager-app</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/open</string><string>-a</string><string>$TARGET/Applications/AVB Manager.app</string></array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+EOF
+/usr/sbin/chown "$CONSOLE_USER" "$AGENTS/ca.arraymusic.avbwatch.plist" "$AGENTS/ca.arraymusic.avbmanager-app.plist"
+
+SUDOERS_TMP="$(/usr/bin/mktemp /tmp/avbwatch.XXXXXX)"
+trap '/bin/rm -f "$SUDOERS_TMP"' EXIT
+/usr/bin/printf '%s ALL=(root) NOPASSWD: /usr/bin/killall coreaudiod\n' "$CONSOLE_USER" > "$SUDOERS_TMP"
+/usr/sbin/visudo -cf "$SUDOERS_TMP" >/dev/null
+/usr/bin/install -o root -g wheel -m 0440 "$SUDOERS_TMP" /etc/sudoers.d/avbwatch
+
+/bin/launchctl bootout "gui/$USER_ID/ca.arraymusic.avbwatch" 2>/dev/null || true
+/bin/launchctl bootout "gui/$USER_ID/ca.arraymusic.avbmanager-app" 2>/dev/null || true
+/bin/launchctl bootstrap "gui/$USER_ID" "$AGENTS/ca.arraymusic.avbwatch.plist"
+/bin/launchctl bootstrap "gui/$USER_ID" "$AGENTS/ca.arraymusic.avbmanager-app.plist"
+exit 0

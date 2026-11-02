@@ -6,6 +6,8 @@
 //   POST /api/lock       {listener, luid, talker?, tuid?}    admin
 //   POST /api/unlock     {listener, luid}                    admin
 //   POST /api/lockall                                        admin
+//   POST /api/release    stop enforcing locks (kept saved)   admin
+//   POST /api/engage     enforce the saved locks again       admin
 //   POST /api/rename     {id, name}                          admin
 
 import Foundation
@@ -62,6 +64,7 @@ final class WebServer {
 
     private func handle(_ r: Request, remote: NWEndpoint) -> Data {
         let host: String = { if case .hostPort(let h, _) = remote { return "\(h)" }; return "?" }()
+        let isLoopback = host == "127.0.0.1" || host == "::1" || host.hasPrefix("::ffff:127.")
         if r.method == "GET" && (r.path == "/" || r.path == "/index.html") { return response(200, "text/html; charset=utf-8", Data(pageHTML.utf8)) }
         if r.method == "GET" && r.path == "/api/state" {
             guard let s = manager.state(), let d = try? JSONEncoder().encode(s) else { return json(503, ["error": "starting up"]) }
@@ -72,7 +75,7 @@ final class WebServer {
         // admin check, with a short lockout after repeated wrong passwords
         var admin = false
         // the menu-bar app on this Mac: token from the private file, accepted from this machine only
-        if let tok = r.headers["x-admin-token"], tok == adminToken, host == "127.0.0.1" || host == "::1" || host.hasPrefix("::ffff:127.") { admin = true }
+        if let tok = r.headers["x-admin-token"], tok == adminToken, isLoopback { admin = true }
         if !admin, let pw = r.headers["x-admin-password"], !pw.isEmpty {
             failLock.lock()
             let lockedOut = (failedLogins[host]?.until ?? .distantPast) > Date()
@@ -95,9 +98,16 @@ final class WebServer {
 
         do {
             switch r.path {
+            case "/api/setup-password":
+                guard isLoopback else { return json(403, ["error": "Set the initial admin password from the AVB Manager Mac."]) }
+                guard let password = body["password"] as? String, password.count >= 8 else {
+                    return json(400, ["error": "Use at least 8 characters for the admin password."])
+                }
+                try manager.queue.sync { try manager.setAdminPassword(password) }
+                return json(200, ["ok": true, "message": "Admin password set"])
             case "/api/login":
                 if admin && r.headers["x-admin-token"] != nil { return json(200, ["ok": true]) }
-                if manager.cfg.adminHash.isEmpty { return json(400, ["error": "No admin password set. On the iMac run: avbwatch passwd"]) }
+                if manager.cfg.adminHash.isEmpty { return json(400, ["error": "Set the initial admin password on the AVB Manager Mac."]) }
                 return admin ? json(200, ["ok": true]) : json(401, ["error": "Enter the admin password"])
             case "/api/patch":
                 guard let l = id("listener"), let lu = uid("luid") else { return json(400, ["error": "missing listener"]) }
@@ -138,6 +148,12 @@ final class WebServer {
                 guard admin else { return json(401, ["error": "Admin password required"]) }
                 manager.queue.sync { if !manager.recoveryState.pending && !manager.recoveryState.running { manager.propose(reason: "Recovery requested manually by the admin.") } }
                 return json(200, ["ok": true])
+            case "/api/release":
+                guard admin else { return json(401, ["error": "Admin password required"]) }
+                return json(200, ["ok": true, "message": manager.queue.sync { manager.release() }])
+            case "/api/engage":
+                guard admin else { return json(401, ["error": "Admin password required"]) }
+                return json(200, ["ok": true, "message": manager.queue.sync { manager.engage() }])
             case "/api/lockall":
                 guard admin else { return json(401, ["error": "Admin password required"]) }
                 let n = manager.queue.sync { manager.lockAll() }

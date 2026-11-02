@@ -53,8 +53,10 @@ func runProcess(_ path: String, _ args: [String], timeout: Double = 30) -> (stat
 }
 
 let venvPython = supportDir.appendingPathComponent("venv/bin/python").path
-let ptHelper = supportDir.appendingPathComponent("pthelper.py").path
+let ptHelper = supportDir.appendingPathComponent("pthelper").path
 let probeTool = supportDir.appendingPathComponent("avbprobe").path
+let bundledHelper = supportDir.appendingPathComponent("bin/pthelper").path
+let bundledProbe = supportDir.appendingPathComponent("bin/avbprobe").path
 
 /// The sudoers rule lets this user restart coreaudiod without a password, and nothing else.
 func recoveryHelperInstalled() -> Bool {
@@ -62,7 +64,9 @@ func recoveryHelperInstalled() -> Bool {
 }
 
 func proToolsInfo() -> (path: String, name: String)? {
-    let r = runProcess(venvPython, [ptHelper, "info"], timeout: 20)
+    let r = FileManager.default.isExecutableFile(atPath: bundledHelper)
+        ? runProcess(bundledHelper, ["info"], timeout: 20)
+        : runProcess(venvPython, [ptHelper, "info"], timeout: 20)
     guard r.status == 0, let d = r.out.split(separator: "\n").last?.data(using: .utf8),
           let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any], let path = j["path"] as? String, !path.isEmpty else { return nil }
     return (path, j["name"] as? String ?? "")
@@ -77,12 +81,15 @@ extension Manager {
     func checkEngineDead() {
         if recoveryState.pending { updateRecoveryDAW() }
         guard let me = entities().first(where: { $0.local }) else { return }
-        let mine = cfg.connections.filter { $0.talkerID == me.id }
+        let mine = cfg.enforced.filter { $0.talkerID == me.id }
         guard !mine.isEmpty else { return }
         let silent = mine.allSatisfy { c in
             let p = watcher.lastResult[c.sinkKey]
             return p == .stalled || p == .unlocked
         }
+        // right after the manager reconnects a stream it takes a moment for packets to show up - not a dead engine
+        let settling = mine.contains { (watcher.lastRepair[$0.sinkKey] ?? .distantPast) > Date().addingTimeInterval(-12) }
+        if silent && settling && watcher.suppressRepairForTalker == nil { return }
         if silent {
             deadCycles += 1
             if watcher.suppressRepairForTalker == nil {
@@ -277,7 +284,8 @@ extension Manager {
         // 5. loop test (the DAW is closed, so the tone only goes out on the test channel)
         if o.loopChannel > 0 {
             step(4, "running")
-            let t = runProcess(probeTool, ["1.0", "--tone", "\(o.loopChannel)", "-40"], timeout: 20)
+            let t = runProcess(FileManager.default.isExecutableFile(atPath: bundledProbe) ? bundledProbe : probeTool,
+                               ["1.0", "--tone", "\(o.loopChannel)", "-40"], timeout: 20)
             let key = "\"\(o.loopChannel)\":"
             if let range = t.out.range(of: key), let v = Double(t.out[range.upperBound...].prefix { "-0123456789.".contains($0) }), v > -46 {
                 step(4, "ok", "tone came back at \(String(format: "%.1f", v)) dBFS")

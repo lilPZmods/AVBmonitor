@@ -28,6 +28,7 @@ struct StateInfo: Codable {
     var time: String; var link: Bool; var healthy: Bool; var adminConfigured: Bool; var sniffing: Bool
     var engineWarning: String?; var recovery: RecoveryInfo; var devices: [DeviceInfo]; var events: [EventInfo]
     var notices: [Notice]?
+    var released: Bool?; var savedLocks: Int?; var offline: [String]?
 }
 
 // MARK: - Client
@@ -60,6 +61,8 @@ final class Store: ObservableObject {
         } catch {
             reachable = false
         }
+        let tip = tooltip
+        if AppDelegate.statusButton()?.toolTip != tip { AppDelegate.statusButton()?.toolTip = tip }
     }
 
     /// Post the manager's new alerts as macOS notifications. Alerts only show while this app runs.
@@ -99,14 +102,22 @@ final class Store: ObservableObject {
     }
 
     // derived
+    var released: Bool { state?.released ?? false }
     var lockedSinks: [(DeviceInfo, SinkInfo)] { (state?.devices ?? []).flatMap { d in d.sinks.filter(\.locked).map { (d, $0) } } }
-    var failing: [(DeviceInfo, SinkInfo)] { lockedSinks.filter { !$0.1.ok } }
+    /// Routes paused on purpose because a device (e.g. the console) is switched off - expected, not a fault.
+    var paused: [(DeviceInfo, SinkInfo)] { lockedSinks.filter { !$0.1.ok && $0.1.state.hasPrefix("paused") } }
+    var failing: [(DeviceInfo, SinkInfo)] { lockedSinks.filter { !$0.1.ok && !$0.1.state.hasPrefix("paused") } }
+    var offlineDevices: [String] { state?.offline ?? [] }
+    /// Locks are intentionally not being enforced: the network is released or the console is off.
+    var bypassed: Bool { released || !offlineDevices.isEmpty }
 
-    enum Level { case ok, warn, bad, offline }
+    enum Level { case ok, warn, bad, offline, bypassed }
     var level: Level {
         guard reachable, let s = state else { return .offline }
         if !s.link || !failing.isEmpty || s.recovery.pending || s.recovery.ok == false { return .bad }
-        if s.engineWarning != nil || s.recovery.running { return .warn }
+        if s.recovery.running { return .warn }
+        if bypassed { return .bypassed }   // a lost AVB device while the console is off is expected too
+        if s.engineWarning != nil { return .warn }
         return .ok
     }
 
@@ -116,8 +127,29 @@ final class Store: ObservableObject {
         if s.recovery.running { return "Recovery running…" }
         if s.recovery.pending { return "Recovery needs your approval" }
         if !failing.isEmpty { return "\(failing.count) locked route\(failing.count == 1 ? "" : "s") failing" }
+        if released { return "Bypassed · network released, \(s.savedLocks ?? 0) routes saved" }
+        if !offlineDevices.isEmpty { return "Bypassed · \(offlineDevices.joined(separator: ", ")) is off" }
         if let w = s.engineWarning { return w }
         return lockedSinks.isEmpty ? "Connected" : "All \(lockedSinks.count) locked routes OK"
+    }
+
+    /// Short readout shown when hovering over the menu-bar icon.
+    var tooltip: String {
+        var lines = ["AVB Manager: \(summary)"]
+        guard reachable, let s = state else { return lines.joined(separator: "\n") }
+        let total = s.savedLocks ?? lockedSinks.count
+        if released {
+            lines.append("Network released: anyone can patch. \(total) routes saved.")
+        } else {
+            let ok = lockedSinks.filter(\.1.ok).count
+            lines.append("Locked: \(ok) of \(total) routes OK" + (paused.isEmpty ? "" : ", \(paused.count) paused"))
+        }
+        if !offlineDevices.isEmpty { lines.append("Off / not on network: \(offlineDevices.joined(separator: ", "))") }
+        for (d, k) in failing.prefix(4) { lines.append("• \(d.name) / \(k.name): \(k.state)") }
+        if failing.count > 4 { lines.append("• …and \(failing.count - 4) more") }
+        if let w = s.engineWarning { lines.append(w) }
+        lines.append(s.link ? "AVB link up · checked \(s.time.suffix(8))" : "AVB link DOWN")
+        return lines.joined(separator: "\n")
     }
 
     func sourceLabel(_ id: String?, _ uid: Int?) -> String {
@@ -157,6 +189,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     static func openMenuPanel() -> Bool {
         // already open: leave it (clicking the icon again would close it)
         if NSApp.windows.contains(where: { $0.isVisible && $0.className.contains("MenuBarExtra") }) { return true }
+        guard let b = statusButton() else { return false }
+        b.performClick(nil)
+        return true
+    }
+
+    /// The menu-bar icon's button (SwiftUI's MenuBarExtra doesn't expose it).
+    static func statusButton() -> NSStatusBarButton? {
         func button(in v: NSView?) -> NSStatusBarButton? {
             guard let v = v else { return nil }
             if let b = v as? NSStatusBarButton { return b }
@@ -164,9 +203,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return nil
         }
         for w in NSApp.windows where w.className.contains("StatusBar") {
-            if let b = button(in: w.contentView) { b.performClick(nil); return true }
+            if let b = button(in: w.contentView) { return b }
         }
-        return false
+        return nil
     }
 }
 
@@ -194,6 +233,7 @@ struct AVBManagerApp: App {
         case .warn: return "exclamationmark.circle"
         case .bad: return "exclamationmark.triangle.fill"
         case .offline: return "antenna.radiowaves.left.and.right.slash"
+        case .bypassed: return "smoke"
         }
     }
 }
@@ -239,7 +279,7 @@ extension ButtonStyle where Self == PanelButtonStyle {
 }
 
 extension Store.Level {
-    var color: Color { switch self { case .ok: return .green; case .warn: return .orange; case .bad: return .red; case .offline: return .secondary } }
+    var color: Color { switch self { case .ok: return .green; case .warn: return .orange; case .bad: return .red; case .offline, .bypassed: return .secondary } }
 }
 
 // MARK: - Menu
@@ -255,7 +295,9 @@ struct MenuView: View {
                 Text(store.summary).font(.headline)
             }
             if let s = store.state {
-                if let w = s.engineWarning { Label(w, systemImage: "music.note").foregroundColor(.orange).font(.callout) }
+                if let w = s.engineWarning {
+                    Label(w, systemImage: "music.note").foregroundColor(store.bypassed ? .secondary : .orange).font(.callout)
+                }
                 if !store.failing.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(store.failing, id: \.1) { d, k in
@@ -269,6 +311,9 @@ struct MenuView: View {
                     .font(.callout).foregroundColor(.secondary)
             }
             if let m = store.message { Text(m).font(.caption).foregroundColor(.secondary) }
+            if store.reachable, let s = store.state {
+                OwnershipButton(released: store.released, saved: s.savedLocks ?? 0)
+            }
             Divider()
             HStack(spacing: 8) {
                 Button("Routing…") { openWindow(id: "routing"); NSApp.activate(ignoringOtherApps: true) }
@@ -288,6 +333,35 @@ struct MenuView: View {
         }
         .padding(14)
         .frame(width: 400)
+    }
+}
+
+/// One switch between "my production owns the network" and "anyone can patch".
+struct OwnershipButton: View {
+    @EnvironmentObject var store: Store
+    let released: Bool
+    let saved: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if released {
+                Button { Task { await store.post("api/engage") } } label: {
+                    Label("Lock my routes", systemImage: "lock.fill").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.panel(.accentColor, prominent: true))
+                .disabled(saved == 0)
+                Text(saved == 0 ? "No routes saved yet. Patch and lock routes in Routing… first."
+                                : "Anyone can patch right now. Locking restores your \(saved) saved routes immediately.")
+                    .font(.caption).foregroundColor(.secondary)
+            } else {
+                Button { Task { await store.post("api/release") } } label: {
+                    Label("Release network", systemImage: "lock.open").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.panel(.orange))
+                Text("Done with the production? Releasing keeps your \(saved) routes saved but stops enforcing them, so others can patch freely. Nothing is disconnected.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+        }
     }
 }
 
@@ -394,7 +468,10 @@ struct RoutingView: View {
                 Text(store.summary).font(.headline)
                 Spacer()
                 if let m = store.message { Text(m).font(.caption).foregroundColor(.secondary).lineLimit(1) }
-                Button("Lock all current routes") { Task { await store.post("api/lockall") } }
+                Button(store.released ? "Save all current routes" : "Lock all current routes") { Task { await store.post("api/lockall") } }
+                Button(store.released ? "Lock my routes" : "Release network") {
+                    Task { await store.post(store.released ? "api/engage" : "api/release") }
+                }
             }
             .padding(12)
             Divider()
@@ -464,7 +541,8 @@ struct SinkRow: View {
             .frame(width: 260)
             VStack(alignment: .leading, spacing: 1) {
                 if sink.locked {
-                    Text(sink.ok ? "Locked · OK" : sink.state).font(.callout).foregroundColor(sink.ok ? .green : .red)
+                    Text(sink.ok ? "Locked · OK" : sink.state).font(.callout)
+                        .foregroundColor(sink.ok ? .green : sink.state.hasPrefix("paused") ? .secondary : .red)
                     if sink.lockTalker != sink.talker || sink.lockTalkerUID != sink.talkerUID {
                         Text("locked to \(store.sourceLabel(sink.lockTalker, sink.lockTalkerUID))").font(.caption).foregroundColor(.secondary)
                     }

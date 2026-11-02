@@ -89,7 +89,11 @@ struct Config: Codable {
     var adminSalt = ""
     var adminHash = ""
     var deviceNames: [String: String] = [:]   // entity ID (hex) -> name set by the admin
-    var connections: [Connection] = []   // the locked routes
+    var connections: [Connection] = []   // the locked routes (kept while the network is released)
+    var released = false                 // admin handed the network back: nothing is enforced until locked up again
+
+    /// The routes being enforced right now.
+    var enforced: [Connection] { released ? [] : connections }
 
     init() {}
 
@@ -111,6 +115,7 @@ struct Config: Codable {
         adminHash = try c.decodeIfPresent(String.self, forKey: .adminHash) ?? ""
         deviceNames = try c.decodeIfPresent([String: String].self, forKey: .deviceNames) ?? [:]
         connections = try c.decodeIfPresent([Connection].self, forKey: .connections) ?? []
+        released = try c.decodeIfPresent(Bool.self, forKey: .released) ?? false
     }
 
     func passwordMatches(_ pw: String) -> Bool {
